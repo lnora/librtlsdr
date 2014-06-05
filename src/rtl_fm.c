@@ -93,6 +93,7 @@
 #define ONE_INT				(1<<14)
 
 static volatile int do_exit = 0;
+static int single = 0;
 static int lcm_post[17] = {1,1,1,3,1,5,3,7,1,9,5,11,3,13,7,15,1};
 static int ACTUAL_BUF_LENGTH;
 static uint32_t MINIMUM_RATE = 1000000;
@@ -100,7 +101,9 @@ static uint32_t MINIMUM_RATE = 1000000;
 static int *atan_lut = NULL;
 static int atan_lut_size = 131072; /* 512 KB */
 static int atan_lut_coef = 8;
+static int freqd = 0;
 
+struct timeval time1, time2;
 // rewrite as dynamic and thread-safe for multi demod/dongle
 #define SHARED_SIZE 6
 int16_t shared_samples[SHARED_SIZE][MAXIMUM_BUF_LENGTH];
@@ -127,7 +130,7 @@ struct dongle_state
 	int      dev_index;
 	uint32_t freq;
 	uint32_t rate;
-  uint32_t bandwidth;
+	uint32_t bandwidth;
 	int      gain;
 	int16_t  *buf16;
 	uint32_t buf_len;
@@ -186,6 +189,8 @@ struct demod_state
 	int      now_lpr;
 	int      prev_lpr_index;
 	int      dc_block, dc_avg;
+	int      log1, log2, log3, log4;
+	int      ds1;
 	int      rotate_enable;
 	struct   translate_state rotate;
 	enum	 agc_mode_t agc_mode;
@@ -229,6 +234,7 @@ struct controller_state
 	int      freq_len;
 	int      freq_now;
 	int      edge;
+	int      speedtest;
 	int      wb_mode;
 	pthread_cond_t hop;
 	pthread_mutex_t hop_m;
@@ -276,6 +282,12 @@ void usage(void)
 		"\t    direct: enable direct sampling\n"
 		"\t    no-mod: enable no-mod direct sampling\n"
 		"\t    offset: enable offset tuning\n"
+		"\t    log1:   enable logging frequency, signal level, date and time - squelch open\n"
+		"\t    log2:   enable logging frequency, signal level, date and time - squelch closed\n"
+		"\t    log3:   enable logging frequency and signal level\n"
+		"\t    log4:   enable logging frequency and signal level\n"
+		"\t    speedtest: enable scanning speed test\n"
+		"\t    ds1: enable dynamic squelch 1\n"		
 		"\t    wav:    generate WAV header\n"
 		"\t    pad:    pad output gaps with zeros\n"
 		"\t    lrmix:  one channel goes to left audio, one to right (broken)\n"
@@ -920,15 +932,47 @@ void full_demod(struct demod_state *d)
 	/* power squelch */
 	if (d->squelch_level) {
 		sr = rms(d->lowpassed, d->lp_len, 1);
+		if (d->log3) {
+			fprintf(stderr, "freq,%10u,Hz,-,signal,%5u,%5u,%5u,%5u,%5u\r", freqd, sr, d->squelch_level, d->squelch_hits, d->conseq_squelch, d->squelch_timer);
+		}
+		if (d->log4) {
+			fprintf(stderr, "freq,%10u,Hz,-,signal,%5u,%5u\n", freqd, sr, d->squelch_level);
+		}		
 		if (sr < d->squelch_level) {
 			do_squelch = 1;}
 	}
 	if (do_squelch) {
 		d->squelch_hits++;
+		if (d->log2) {
+			if (d->squelch_hits > 0) {
+				time_t long_time;
+				struct timeval tv;
+				struct tm *newtime;
+				gettimeofday(&tv,0);
+				time(&long_time);
+				newtime = localtime(&long_time);
+				fprintf(stderr, "freq,%10u,Hz,-,signal,%5u,%5u,-,%04d.%02d.%02d,time,%02d:%02d:%02d.%03ld\n", freqd, sr, d->squelch_level, newtime->tm_year+1900, newtime->tm_mon+1, newtime->tm_mday, newtime->tm_hour,newtime->tm_min,newtime->tm_sec, (long)tv.tv_usec / 1000);
+			}
+		}		
 		for (i=0; i<d->lp_len; i++) {
 			d->lowpassed[i] = 0;
 		}
+		if (d->ds1) {
+			d->squelch_level = sr * 1.8;
+			fprintf(stderr, "ds1,%u,%d\n", sr, d->squelch_level);
+		}		
 	} else {
+		if (d->log1) {
+			if (d->squelch_hits > 0) {
+				time_t long_time;
+				struct timeval tv;
+				struct tm *newtime;
+				gettimeofday(&tv,0);
+				time(&long_time);
+				newtime = localtime(&long_time);
+				fprintf(stderr, "%u,%u,%u,%u,%u,%04d.%02d.%02d,%02d:%02d:%02d.%03ld,SO\n", freqd, sr, d->squelch_level, d->conseq_squelch, d->squelch_timer, newtime->tm_year+1900, newtime->tm_mon+1, newtime->tm_mday, newtime->tm_hour,newtime->tm_min,newtime->tm_sec, (long)tv.tv_usec / 1000);
+			}
+		}		
 		d->squelch_hits = 0;
 		d->squelch_timer++;
 	}
@@ -1293,6 +1337,7 @@ static void *controller_thread_fn(void *arg)
 	// might be no good using a controller thread if retune/rate blocks
 	int i;
 	struct controller_state *s = arg;
+	double elapsedtime;
 
 	if (s->wb_mode) {
 		if (verbosity)
@@ -1319,6 +1364,7 @@ static void *controller_thread_fn(void *arg)
 		fprintf(stderr, "verbose_set_frequency(%.0f Hz)\n", (double)dongle.freq);
 		fprintf(stderr, "  frequency is away from parametrized one, to avoid negative impact from dc\n");
 	}
+	freqd = dongle.freq;
 	verbose_set_frequency(dongle.dev, dongle.freq);
 	fprintf(stderr, "Oversampling input by: %ix.\n", demod.downsample);
 	fprintf(stderr, "Oversampling output by: %ix.\n", demod.post_downsample);
@@ -1339,6 +1385,18 @@ static void *controller_thread_fn(void *arg)
 			continue;}
 		/* hacky hopping */
 		s->freq_now = (s->freq_now + 1) % s->freq_len;
+		freqd = s->freq_now;
+		if (s->freq_now == 0) {
+			if (controller.speedtest) {
+				gettimeofday(&time2, NULL);
+				elapsedtime = (time2.tv_sec - time1.tv_sec) * 1000.0;
+				elapsedtime += (time2.tv_usec - time1.tv_usec) / 1000.0;
+				fprintf(stderr, "%8.2f steps/s - elapsed time %6.0f ms -  %5.0u steps\n",1/(elapsedtime/s->freq_len)*1000 ,elapsedtime, s->freq_len);
+				time1 = time2;}
+			/* single-shot mode */
+			if (single) {
+				do_exit = 1;}
+		}		
 		optimal_settings(s->freqs[s->freq_now], demod.rate_in);
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
 		dongle.mute = BUFFER_DUMP;
@@ -1407,6 +1465,11 @@ void demod_init(struct demod_state *s)
 	s->now_lpr = 0;
 	s->dc_block = 1;
 	s->dc_avg = 0;
+	s->log1 = 0;
+	s->log2 = 0;
+	s->log3 = 0;
+	s->log4 = 0;
+	s->ds1 = 0;	
 	pthread_rwlock_init(&s->rw, NULL);
 	pthread_cond_init(&s->ready, NULL);
 	pthread_mutex_init(&s->ready_m, NULL);
@@ -1451,6 +1514,7 @@ void controller_init(struct controller_state *s)
 	s->freqs[0] = 100000000;
 	s->freq_len = 0;
 	s->edge = 0;
+	s->speedtest = 0;
 	s->wb_mode = 0;
 	pthread_cond_init(&s->hop, NULL);
 	pthread_mutex_init(&s->hop_m, NULL);
@@ -1558,7 +1622,7 @@ int main(int argc, char **argv)
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:L:o:t:r:p:E:q:F:A:M:c:v:h:w:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:L:o:t:r:p:E:q:F:A:M:c:v:h:w:1:")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1609,6 +1673,9 @@ int main(int argc, char **argv)
 			dongle.ppm_error = atoi(optarg);
 			custom_ppm = 1;
 			break;
+		case '1':
+			single = 1;
+			break;			
 		case 'E':
 			if (strcmp("edge",  optarg) == 0) {
 				controller.edge = 1;}
@@ -1627,6 +1694,18 @@ int main(int argc, char **argv)
 			if (strcmp("offset",  optarg) == 0) {
 				dongle.offset_tuning = 1;
 				dongle.pre_rotate = 0;}
+			if (strcmp("log1", optarg) == 0) {
+				demod.log1 = 1;}
+			if (strcmp("log2", optarg) == 0) {
+				demod.log2 = 1;}
+			if (strcmp("log3", optarg) == 0) {
+				demod.log3 = 1;}
+			if (strcmp("log4", optarg) == 0) {
+				demod.log4 = 1;}			
+			if (strcmp("speedtest",  optarg) == 0) {
+				controller.speedtest = 1;}
+			if (strcmp("ds1", optarg) == 0) {
+				demod.ds1 = 1;}			
 			if (strcmp("wav",  optarg) == 0) {
 				output.wav_format = 1;}
 			if (strcmp("pad",  optarg) == 0) {
