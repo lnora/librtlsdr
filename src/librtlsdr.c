@@ -64,6 +64,7 @@ typedef struct rtlsdr_tuner_iface {
 	int (*set_gain)(void *, int gain /* tenth dB */);
 	int (*set_if_gain)(void *, int stage, int gain /* tenth dB */);
 	int (*set_gain_mode)(void *, int manual);
+	int (*set_if_freq)(void *, uint32_t freq /* Hz */);
 } rtlsdr_tuner_iface_t;
 
 enum rtlsdr_async_status {
@@ -124,10 +125,10 @@ struct rtlsdr_dev {
 	int dev_lost;
 	int driver_active;
 	unsigned int xfer_errors;
+	int tuner_initialized;
 };
 
 void rtlsdr_set_gpio_bit(rtlsdr_dev_t *dev, uint8_t gpio, int val);
-static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq);
 
 /* generic tuner interface functions, shall be moved to the tuner implementations */
 int e4000_init(void *dev) {
@@ -242,16 +243,13 @@ int r820t_set_freq(void *dev, uint32_t freq) {
 }
 
 int r820t_set_bw(void *dev, int bw) {
-	int r;
 	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
+	return r82xx_set_bw(&devt->r82xx_p, bw);
+}
 
-	r = r82xx_set_bandwidth(&devt->r82xx_p, bw, devt->rate);
-	if(r < 0)
-		return r;
-	r = rtlsdr_set_if_freq(devt, r);
-	if (r)
-		return r;
-	return rtlsdr_set_center_freq(devt, devt->freq);
+int r820t_set_if_freq(void *dev, uint32_t freq) {
+	rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
+	return r82xx_set_if_freq(&devt->r82xx_p, freq);
 }
 
 int r820t_set_gain(void *dev, int gain) {
@@ -266,37 +264,37 @@ int r820t_set_gain_mode(void *dev, int manual) {
 /* definition order must match enum rtlsdr_tuner */
 static rtlsdr_tuner_iface_t tuners[] = {
 	{
-		NULL, NULL, NULL, NULL, NULL, NULL, NULL /* dummy for unknown tuners */
+		NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL /* dummy for unknown tuners */
 	},
 	{
 		e4000_init, e4000_exit,
 		e4000_set_freq, e4000_set_bw, e4000_set_gain, e4000_set_if_gain,
-		e4000_set_gain_mode
+		e4000_set_gain_mode, NULL
 	},
 	{
 		_fc0012_init, fc0012_exit,
 		fc0012_set_freq, fc0012_set_bw, _fc0012_set_gain, NULL,
-		fc0012_set_gain_mode
+		fc0012_set_gain_mode, NULL
 	},
 	{
 		_fc0013_init, fc0013_exit,
 		fc0013_set_freq, fc0013_set_bw, _fc0013_set_gain, NULL,
-		fc0013_set_gain_mode
+		fc0013_set_gain_mode, NULL
 	},
 	{
 		fc2580_init, fc2580_exit,
 		_fc2580_set_freq, fc2580_set_bw, fc2580_set_gain, NULL,
-		fc2580_set_gain_mode
+		fc2580_set_gain_mode, NULL
 	},
 	{
 		r820t_init, r820t_exit,
 		r820t_set_freq, r820t_set_bw, r820t_set_gain, NULL,
-		r820t_set_gain_mode
+		r820t_set_gain_mode, r820t_set_if_freq
 	},
 	{
 		r820t_init, r820t_exit,
 		r820t_set_freq, r820t_set_bw, r820t_set_gain, NULL,
-		r820t_set_gain_mode
+		r820t_set_gain_mode, r820t_set_if_freq
 	},
 };
 
@@ -678,6 +676,7 @@ int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
 		rtlsdr_set_i2c_repeater(dev, 1);
 		r = dev->tuner->exit(dev); /* deinitialize tuner */
 		rtlsdr_set_i2c_repeater(dev, 0);
+		dev->tuner_initialized = 0;
 	}
 
 	/* poweroff demodulator and ADCs */
@@ -686,7 +685,7 @@ int rtlsdr_deinit_baseband(rtlsdr_dev_t *dev)
 	return r;
 }
 
-static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
+int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 {
 	uint32_t rtl_xtal;
 	int32_t if_freq;
@@ -709,6 +708,14 @@ static int rtlsdr_set_if_freq(rtlsdr_dev_t *dev, uint32_t freq)
 	tmp = if_freq & 0xff;
 	r |= rtlsdr_demod_write_reg(dev, 1, 0x1b, tmp, 1);
 
+	/* Tell the R820T driver which IF frequency we are currently using
+	 * so that it can choose the optimal IF filter settings.
+	 * Works for normal tuning as well as no-mod direct sampling! */
+	if(dev->tuner_initialized && dev->tuner && dev->tuner->set_if_freq) {
+		rtlsdr_set_i2c_repeater(dev, 1);
+		dev->tuner->set_if_freq(dev, freq);
+		rtlsdr_set_i2c_repeater(dev, 0);
+	}
 	return r;
 }
 
@@ -1172,13 +1179,38 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 	if (!dev)
 		return -1;
 
-	if (on) {
+	if (on == 1 || on == 2) {
 		if (dev->tuner && dev->tuner->exit) {
 			rtlsdr_set_i2c_repeater(dev, 1);
 			r = dev->tuner->exit(dev);
 			rtlsdr_set_i2c_repeater(dev, 0);
+			dev->tuner_initialized = 0;
 		}
+    }
 
+	/* set up no-mod direct sampling */
+	if (on == 3 && dev->tuner) {
+		if (dev->tuner_type == RTLSDR_TUNER_E4000) {
+			fprintf(stderr, "Tuning E4000 to 3708 MHz\n");
+			rtlsdr_set_i2c_repeater(dev, 1);
+			dev->tuner->init(dev);
+			dev->tuner_initialized = 1;
+			dev->tuner->set_freq(dev, 3708000000u);
+			e4000_set_bw(dev, 15000000);
+			rtlsdr_set_i2c_repeater(dev, 0);
+		}
+		if (dev->tuner_type == RTLSDR_TUNER_R820T) {
+			rtlsdr_dev_t* devt = (rtlsdr_dev_t*)dev;
+			rtlsdr_set_i2c_repeater(dev, 1);
+			dev->tuner->init(dev);
+			dev->tuner_initialized = 1;
+			r82xx_set_nomod(&devt->r82xx_p);
+			rtlsdr_set_i2c_repeater(dev, 0);
+		}
+	}
+
+	/* common to all direct modes */
+	if (on) {
 		/* disable Zero-IF mode */
 		r |= rtlsdr_demod_write_reg(dev, 1, 0xb1, 0x1a, 1);
 
@@ -1198,11 +1230,12 @@ int rtlsdr_set_direct_sampling(rtlsdr_dev_t *dev, int on)
 			rtlsdr_set_i2c_repeater(dev, 1);
 			r |= dev->tuner->init(dev);
 			rtlsdr_set_i2c_repeater(dev, 0);
+			dev->tuner_initialized = 1;
 		}
 
 		if ((dev->tuner_type == RTLSDR_TUNER_R820T) ||
 		    (dev->tuner_type == RTLSDR_TUNER_R828D)) {
-			r |= rtlsdr_set_if_freq(dev, R82XX_IF_FREQ);
+			r |= rtlsdr_set_if_freq(dev, R82XX_DEFAULT_IF_FREQ);
 
 			/* enable spectrum inversion */
 			r |= rtlsdr_demod_write_reg(dev, 1, 0x15, 0x01, 1);
@@ -1611,7 +1644,7 @@ found:
 
 		/* the R82XX use 3.57 MHz IF for the DVB-T 6 MHz mode, and
 		 * 4.57 MHz for the 8 MHz mode */
-		rtlsdr_set_if_freq(dev, R82XX_IF_FREQ);
+		rtlsdr_set_if_freq(dev, R82XX_DEFAULT_IF_FREQ);
 
 		/* enable spectrum inversion */
 		rtlsdr_demod_write_reg(dev, 1, 0x15, 0x01, 1);
@@ -1624,8 +1657,10 @@ found:
 		break;
 	}
 
-	if (dev->tuner->init)
+	if (dev->tuner->init) {
 		r = dev->tuner->init(dev);
+		dev->tuner_initialized = 1;
+	}
 
 	rtlsdr_set_i2c_repeater(dev, 0);
 
