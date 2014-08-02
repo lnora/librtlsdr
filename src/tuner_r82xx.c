@@ -506,7 +506,10 @@ static int r82xx_set_pll(struct r82xx_priv *priv, uint32_t freq)
 	else
 		val = 0x00;
 
-	rc = r82xx_write_reg_mask(priv, 0x12, val, 0x08);
+	if (priv->disable_dither)
+		val |= 0x10;
+
+	rc = r82xx_write_reg_mask(priv, 0x12, val, 0x18);
 	if (rc < 0)
 		return rc;
 
@@ -1179,6 +1182,36 @@ err:
 	if (rc < 0)
 		fprintf(stderr, "%s: failed=%d\n", __FUNCTION__, rc);
 	return rc;
+}
+
+int r82xx_set_nomod(struct r82xx_priv *priv)
+{
+	int rc = -1;
+
+	fprintf(stderr, "Using R820T no-mod direct sampling mode\n");
+
+	rc = r82xx_set_tv_standard(priv, 8, TUNER_DIGITAL_TV, 0);
+	if (rc < 0)
+		goto err;
+
+	/* experimentally determined magic numbers
+	 * needs more experimenting with all the registers */
+	rc = r82xx_set_mux(priv, 300000000);
+	if (rc < 0)
+		goto err;
+
+	r82xx_set_pll(priv, 25000000);
+
+err:
+	if (rc < 0)
+		fprintf(stderr, "%s: failed=%d\n", __FUNCTION__, rc);
+	return rc;
+}
+
+int r82xx_set_dither(struct r82xx_priv *priv, int dither)
+{
+	priv->disable_dither = !dither;
+	return 0;
 }
 
 /*
