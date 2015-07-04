@@ -87,6 +87,8 @@
 
 #define FREQUENCIES_LIMIT		1000
 
+#define SQUELCH_TIMEOUT			100
+
 #define PI_INT				(1<<14)
 #define ONE_INT				(1<<14)
 
@@ -176,6 +178,7 @@ struct demod_state
 	int      post_downsample;
 	int      output_scale;
 	int      squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch;
+	int      squelch_timer;
 	int      downsample_passes;
 	int      comp_fir_size;
 	int      custom_atan;
@@ -927,6 +930,7 @@ void full_demod(struct demod_state *d)
 		}
 	} else {
 		d->squelch_hits = 0;
+		d->squelch_timer++;
 	}
 	if (d->squelch_level && d->squelch_hits > d->conseq_squelch) {
 		d->agc->gain_num = d->agc->gain_den;
@@ -1055,12 +1059,19 @@ static void *demod_thread_fn(void *arg)
 		o->buf = d->lowpassed;
 		o->len = d->lp_len;
 		pthread_rwlock_unlock(&o->rw);
-		if (controller.freq_len > 1 && d->squelch_level && \
-		    d->squelch_hits > d->conseq_squelch) {
+		if (controller.freq_len > 1 && d->squelch_level) {
+		    if (d->squelch_hits > d->conseq_squelch) {
 			unmark_shared_buffer(d->lowpassed);
 			d->squelch_hits = d->conseq_squelch + 1;  /* hair trigger */
 			safe_cond_signal(&controller.hop, &controller.hop_m);
 			continue;
+		    }
+
+		    if (d->squelch_timer >= SQUELCH_TIMEOUT) {
+			    d->squelch_timer = 0;
+			    safe_cond_signal(&controller.hop, &controller.hop_m);
+			    continue;
+		    }
 		}
 		safe_cond_signal(&o->ready, &o->ready_m);
 		pthread_mutex_lock(&o->trycond_m);
@@ -1377,6 +1388,7 @@ void demod_init(struct demod_state *s)
 	s->conseq_squelch = 10;
 	s->terminate_on_squelch = 0;
 	s->squelch_hits = 11;
+	s->squelch_timer = 0;
 	s->downsample_passes = 0;
 	s->comp_fir_size = 0;
 	s->prev_index = 0;
