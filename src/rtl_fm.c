@@ -125,6 +125,7 @@ struct dongle_state
 	int      dev_index;
 	uint32_t freq;
 	uint32_t rate;
+  uint32_t bandwidth;
 	int      gain;
 	int16_t  *buf16;
 	uint32_t buf_len;
@@ -252,7 +253,8 @@ void usage(void)
 		"\t    raw mode outputs 2x16 bit IQ pairs\n"
 		"\t[-s sample_rate (default: 24k)]\n"
 		"\t[-d device_index (default: 0)]\n"
-		"\t[-g tuner_gain (default: automatic)]\n"
+    "\t[-g tuner_gain (default: automatic)]\n"
+    "\t[-w tuner_bandwidth (default: automatic)]\n"
 		"\t[-l squelch_level (default: 0/off)]\n"
 		"\t[-L N  prints levels every N calculations]\n"
 		"\t    output are comma separated values (csv):\n"
@@ -1541,7 +1543,7 @@ int main(int argc, char **argv)
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:L:o:t:r:p:E:F:A:M:c:v:h")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:L:o:t:r:p:E:q:F:A:M:c:v:h:w:")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1666,6 +1668,9 @@ int main(int argc, char **argv)
 		case 'v':
 			verbosity = (int)atof(optarg);
 			break;
+    case 'w':
+      dongle.bandwidth = (uint32_t)atofs(optarg);
+      break;
 		case 'h':
 		default:
 			usage();
@@ -1740,6 +1745,8 @@ int main(int argc, char **argv)
 		verbose_ppm_eeprom(dongle.dev, &(dongle.ppm_error));
 	}
 	verbose_ppm_set(dongle.dev, dongle.ppm_error);
+
+  verbose_set_bandwidth(dongle.dev, dongle.bandwidth);
 
 	if (strcmp(output.filename, "-") == 0) { /* Write samples to stdout */
 		output.file = stdout;
