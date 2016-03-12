@@ -1365,6 +1365,7 @@ void dongle_init(struct dongle_state *s)
 	s->targets[0] = &demod;
 	s->targets[1] = NULL;
 	s->buf16 = mark_shared_buffer();
+	s->bandwidth = 0;
 }
 
 void demod_init(struct demod_state *s)
