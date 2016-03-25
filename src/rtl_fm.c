@@ -253,8 +253,8 @@ void usage(void)
 		"\t    raw mode outputs 2x16 bit IQ pairs\n"
 		"\t[-s sample_rate (default: 24k)]\n"
 		"\t[-d device_index (default: 0)]\n"
-    "\t[-g tuner_gain (default: automatic)]\n"
-    "\t[-w tuner_bandwidth (default: automatic)]\n"
+                "\t[-g tuner_gain (default: automatic)]\n"
+                "\t[-w tuner_bandwidth (default: automatic)]\n"
 		"\t[-l squelch_level (default: 0/off)]\n"
 		"\t[-L N  prints levels every N calculations]\n"
 		"\t    output are comma separated values (csv):\n"
@@ -277,6 +277,7 @@ void usage(void)
 		"\t    pad:    pad output gaps with zeros\n"
 		"\t    lrmix:  one channel goes to left audio, one to right (broken)\n"
 		"\t            remember to enable stereo (-c 2) in sox\n"
+		"\t    rtlagc: enable rtl2832's digital agc (default: off)\n"
 		"\tfilename ('-' means stdout)\n"
 		"\t    omitting the filename also uses stdout\n\n"
 		"Experimental options:\n"
@@ -1538,6 +1539,7 @@ int main(int argc, char **argv)
 	int custom_ppm = 0;
 
 	int timeConstant = 75; /* default: U.S. 75 uS */
+	int rtlagc = 0;
 	dongle_init(&dongle);
 	demod_init(&demod);
 	demod_init(&demod2);
@@ -1619,6 +1621,8 @@ int main(int argc, char **argv)
 				output.padded = 1;}
 			if (strcmp("lrmix",  optarg) == 0) {
 				output.lrmix = 1;}
+			if (strcmp("rtlagc", optarg) == 0 || strcmp("agc", optarg) == 0) {
+				rtlagc = 1;}
 			break;
 		case 'F':
 			demod.downsample_passes = 1;  /* truthy placeholder */
@@ -1745,6 +1749,8 @@ int main(int argc, char **argv)
 	if (!custom_ppm) {
 		verbose_ppm_eeprom(dongle.dev, &(dongle.ppm_error));
 	}
+	rtlsdr_set_agc_mode(dongle.dev, rtlagc);
+
 	verbose_ppm_set(dongle.dev, dongle.ppm_error);
 
   verbose_set_bandwidth(dongle.dev, dongle.bandwidth);
