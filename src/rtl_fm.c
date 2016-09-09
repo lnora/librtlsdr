@@ -82,10 +82,12 @@
 #define MAXIMUM_OVERSAMPLE		16
 #define MAXIMUM_BUF_LENGTH		(MAXIMUM_OVERSAMPLE * DEFAULT_BUF_LENGTH)
 #define AUTO_GAIN			-100
+#define DEFAULT_BUFFER_DUMP		4096
+
 #define BUFFER_DUMP			4096
 #define MAXIMUM_RATE			2400000
 
-#define FREQUENCIES_LIMIT		1000
+#define FREQUENCIES_LIMIT		1024
 
 #define SQUELCH_TIMEOUT			100
 
@@ -128,6 +130,7 @@ struct dongle_state
 	pthread_t thread;
 	rtlsdr_dev_t *dev;
 	int      dev_index;
+	uint32_t userFreq;
 	uint32_t freq;
 	uint32_t rate;
 	uint32_t bandwidth;
@@ -255,6 +258,7 @@ void usage(void)
 		"\t-f frequency_to_tune_to [Hz]\n"
 		"\t    use multiple -f for scanning (requires squelch)\n"
 		"\t    ranges supported, -f 118M:137M:25k\n"
+		"\t[-m minimum_capture_rate Hz (default: 1m, min=900k, max=3.2m)]\n"
 		"\t[-v verbosity (default: 0)]\n"
 		"\t[-M modulation (default: fm)]\n"
 		"\t    fm or nbfm or nfm, wbfm or wfm, raw or iq, am, usb, lsb\n"
@@ -263,11 +267,11 @@ void usage(void)
 		"\t[-s sample_rate (default: 24k)]\n"
 		"\t[-d device_index (default: 0)]\n"
                 "\t[-g tuner_gain (default: automatic)]\n"
-                "\t[-w tuner_bandwidth (default: automatic)]\n"
+		"\t[-w tuner_bandwidth in Hz (default: automatic)]\n"
 		"\t[-l squelch_level (default: 0/off)]\n"
 		"\t[-L N  prints levels every N calculations]\n"
 		"\t    output are comma separated values (csv):\n"
-		"\t    mean since last output, max since last output, overall max, squelch\n"
+		"\t	avg rms since last output, max rms since last output, overall max rms, squelch (paramed), rms, rms level, avg rms level\n"
 		"\t[-c de-emphasis_time_constant in us for wbfm. 'us' or 'eu' for 75/50 us (default: us)]\n"
 		//"\t    for fm squelch is inverted\n"
 		"\t[-o oversampling (default: 1, 4 recommended)]\n"
@@ -906,6 +910,7 @@ void software_agc(struct demod_state *d)
 
 void full_demod(struct demod_state *d)
 {
+	double freqK, avgRms, rmsLevel, avgRmsLevel;
 	int i, ds_p;
 	int do_squelch = 0;
 	int sr = 0;
@@ -984,13 +989,18 @@ void full_demod(struct demod_state *d)
 		if (!sr)
 			sr = rms(d->lowpassed, d->lp_len, 1);
 		--printLevelNo;
-		if (printLevels) {
+		if (printLevels && sr >= 0) {
 			levelSum += sr;
 			if (levelMax < sr)		levelMax = sr;
 			if (levelMaxMax < sr)	levelMaxMax = sr;
 			if  (!printLevelNo) {
 				printLevelNo = printLevels;
-				fprintf(stderr, "%f, %d, %d, %d\n", (levelSum / printLevels), levelMax, levelMaxMax, d->squelch_level );
+				freqK = dongle.userFreq /1000.0;
+				avgRms = levelSum / printLevels;
+				rmsLevel = 20.0 * log10( 1E-10 + sr );
+				avgRmsLevel = 20.0 * log10( 1E-10 + avgRms );
+				fprintf(stderr, "%.3f kHz, %.1f avg rms, %d max rms, %d max max rms, %d squelch rms, %d rms, %.1f dB rms level, %.2f dB avg rms level\n",
+					freqK, avgRms, levelMax, levelMaxMax, d->squelch_level, sr, rmsLevel, avgRmsLevel );
 				levelMax = 0;
 				levelSum = 0;
 			}
@@ -1237,33 +1247,37 @@ static void optimal_settings(int freq, int rate)
 		dm->downsample_passes = (int)log2(dm->downsample) + 1;
 		dm->downsample = 1 << dm->downsample_passes;
 	}
+	if (verbosity >= 2) {
+		fprintf(stderr, "downsample_passes = %d (= # of fifth_order() iterations), downsample = %d\n", dm->downsample_passes, dm->downsample );
+	}
 	capture_freq = freq;
 	capture_rate = dm->downsample * dm->rate_in;
 	if (d->pre_rotate) {
 		capture_freq = freq + capture_rate/4;}
-	if (verbosity)
+	if (verbosity >= 2)
 		fprintf(stderr, "capture_rate = dm->downsample * dm->rate_in = %d * %d = %d\n", dm->downsample, dm->rate_in, capture_rate );
 	if (!d->offset_tuning) {
-		capture_freq = freq + capture_rate/4;
-		if (verbosity)
-			fprintf(stderr, "optimal_settings(freq = %d): capture_freq = freq + capture_rate/4 = %d\n", freq, capture_freq );
+		capture_freq = freq - capture_rate/4;
+		if (verbosity >= 2)
+			fprintf(stderr, "optimal_settings(freq = %u): capture_freq = freq - capture_rate/4 = %u\n", freq, capture_freq );
 	}
 	capture_freq += cs->edge * dm->rate_in / 2;
-	if (verbosity)
-		fprintf(stderr, "optimal_settings(freq = %d): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %d\n", freq, cs->edge, dm->rate_in, capture_freq );
+	if (verbosity >= 2)
+		fprintf(stderr, "optimal_settings(freq = %u): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %u\n", freq, cs->edge, dm->rate_in, capture_freq );
 	dm->output_scale = (1<<15) / (128 * dm->downsample);
 	if (dm->output_scale < 1) {
 		dm->output_scale = 1;}
 	if (dm->mode_demod == &fm_demod) {
 		dm->output_scale = 1;}
+	d->userFreq = freq;
 	d->freq = (uint32_t)capture_freq;
 	d->rate = (uint32_t)capture_rate;
 	//d->pre_rotate = 0;
 	//demod.rotate_enable = 1;
 	//demod.rotate.angle = -0.25 * 2 * M_PI;
 	//translate_init(&demod.rotate);
-	if (verbosity)
-		fprintf(stderr, "optimal_settings(freq = %d) delivers freq %.0f, rate %.0f\n", freq, (double)d->freq, (double)d->rate );
+	if (verbosity >= 2)
+		fprintf(stderr, "optimal_settings(freq = %u) delivers freq %.0f, rate %.0f\n", freq, (double)d->freq, (double)d->rate );
 }
 
 void clone_demod(struct demod_state *d2, struct demod_state *d1)
@@ -1341,7 +1355,7 @@ static void *controller_thread_fn(void *arg)
 
 	if (s->wb_mode) {
 		if (verbosity)
-			fprintf(stderr, "wbfm: adding 16000 Hz to every intput frequency\n");
+			fprintf(stderr, "wbfm: adding 16000 Hz to every input frequency\n");
 		for (i=0; i < s->freq_len; i++) {
 			s->freqs[i] += 16000;}
 	}
@@ -1361,7 +1375,7 @@ static void *controller_thread_fn(void *arg)
 
 	/* Set the frequency */
 	if (verbosity) {
-		fprintf(stderr, "verbose_set_frequency(%.0f Hz)\n", (double)dongle.freq);
+		fprintf(stderr, "verbose_set_frequency(%.3f kHz)\n", (double)dongle.userFreq /1000.0);
 		fprintf(stderr, "  frequency is away from parametrized one, to avoid negative impact from dc\n");
 	}
 	freqd = dongle.freq;
@@ -1622,7 +1636,7 @@ int main(int argc, char **argv)
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:g:s:b:l:L:o:t:r:p:E:q:F:A:M:c:v:h:w:1:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:m:g:s:b:l:L:o:t:r:p:E:q:F:A:M:c:v:h:w:1:")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1638,6 +1652,9 @@ int main(int argc, char **argv)
 				controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
 				controller.freq_len++;
 			}
+			break;
+		case 'm':
+			MINIMUM_RATE = (int)atofs(optarg);
 			break;
 		case 'g':
 			dongle.gain = (int)(atof(optarg) * 10);
@@ -1762,17 +1779,21 @@ int main(int argc, char **argv)
 				timeConstant = (int)atof(optarg);
 			break;
 		case 'v':
-			verbosity = (int)atof(optarg);
+			++verbosity;
 			break;
     case 'w':
       dongle.bandwidth = (uint32_t)atofs(optarg);
       break;
 		case 'h':
+		case '?':
 		default:
 			usage();
 			break;
 		}
 	}
+
+	if (verbosity)
+		fprintf(stderr, "verbosity set to %d\n", verbosity);
 
 	agc_init(&demod);
 
