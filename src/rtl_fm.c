@@ -232,18 +232,23 @@ struct output_state
 	int      lrmix;
 };
 
+typedef struct fstate
+{
+	uint32_t freq;
+	int      squelch, conseq_squelch, squelch_timeout;
+	int      gain, ppm;
+	int      min_sr, max_sr, prev_sr, squelch_delta, squelch_sum, squelch_avg;
+	time_t   first_squelch, last_squelch;
+} freq_state;
+
 struct controller_state
 {
 	int      exit_flag;
 	pthread_t thread;
-	uint32_t freqs[FREQUENCIES_LIMIT];
 	int      freq_len;
 	int      freq_now;
-	int      squelches[FREQUENCIES_LIMIT];
-	int      conseq_squelches[FREQUENCIES_LIMIT];
-	int      squelch_timeouts[FREQUENCIES_LIMIT];	
-	int      gains[FREQUENCIES_LIMIT];
-	int      ppms[FREQUENCIES_LIMIT];	
+	freq_state freqs[FREQUENCIES_LIMIT];
+	freq_state *freq;	
 	int      edge;
 	int      speedtest;
 	int      wb_mode;
@@ -330,11 +335,16 @@ void usage(void)
 	exit(1);
 }
 
+/* more cond dumbness */
+#define safe_cond_signal(n, m) pthread_mutex_lock(m); pthread_cond_signal(n); pthread_mutex_unlock(m)
+#define safe_cond_wait(n, m) pthread_mutex_lock(m); pthread_cond_wait(n, m); pthread_mutex_unlock(m)
+
 void load_frequencies(char *filename, int reload)
 {
 	char line[LINE_MAX];
 	char *s;
 	FILE *fp;
+	freq_state *f;
 	
 	if (reload == 1) {
 		controller.freq_len = 0;
@@ -342,6 +352,8 @@ void load_frequencies(char *filename, int reload)
 	
 	fp = fopen(filename, "r");
 	if (fp != NULL) {
+		safe_cond_signal(&controller.hop, &controller.hop_m);
+
 		while (fgets(line, LINE_MAX, fp) != NULL)
 		{			
 			char *tok, *e;
@@ -354,7 +366,8 @@ void load_frequencies(char *filename, int reload)
 			if (idx == 0) {
 				continue;
 			}
-		
+
+			f = &controller.freqs[controller.freq_len];
 			/* frequency, [squelch], [conseq_squelch], [squelch_timeout], [gain], [ppm] 
 			 * * = use default value
 			 */
@@ -370,27 +383,27 @@ void load_frequencies(char *filename, int reload)
 				switch (i)
 				{
 					case 0:
-						controller.freqs[controller.freq_len] = (uint32_t)atofs(tok);
+						f->freq = (uint32_t)atofs(tok);
 						break;
 						
 					case 1:
-						controller.squelches[controller.freq_len] = (int)atof(tok);
+						f->squelch = (int)atof(tok);
 						break;
 
 					case 2:
-						controller.conseq_squelches[controller.freq_len] = (int)atof(tok);
+						f->conseq_squelch = (int)atof(tok);
 						break;
 
 					case 3:
-						controller.squelch_timeouts[controller.freq_len] = (int)atof(tok);
+						f->squelch_timeout = (int)atof(tok);
 						break;
 						
 					case 4:
-						controller.gains[controller.freq_len] = (int)(atof(tok) * 10);
+						f->gain = (int)(atof(tok) * 10);
 						break;
 						
 					case 5:
-						controller.ppms[controller.freq_len] = atoi(tok);
+						f->ppm = atoi(tok);
 						break;
 				}
 				i++;
@@ -422,14 +435,17 @@ static void sighandler(int signum)
 {
 	fprintf(stderr, "Signal caught, exiting!\n");
 	int i;
+	freq_state *f;
 	
 	if (signum == SIGUSR1) {
 		fprintf(stderr, "Reload frequencies\n");
+		safe_cond_signal(&controller.hop, &controller.hop_m);
 		for (i = 0; i < FREQUENCIES_LIMIT; i++) {
-			controller.squelches[i] = demod.squelch_level;
-			controller.conseq_squelches[i] = demod.conseq_squelch;
-			controller.gains[i] = dongle.gain;
-			controller.ppms[i] = dongle.ppm_error;
+			f = &controller.freqs[i];
+			f->squelch = demod.squelch_level;
+			f->conseq_squelch = demod.conseq_squelch;
+			f->gain = dongle.gain;
+			f->ppm = dongle.ppm_error;			
 		}		
 		load_frequencies(output.freqsfilename, 1);
 	} else {
@@ -439,10 +455,6 @@ static void sighandler(int signum)
 	}	
 }
 #endif
-
-/* more cond dumbness */
-#define safe_cond_signal(n, m) pthread_mutex_lock(m); pthread_cond_signal(n); pthread_mutex_unlock(m)
-#define safe_cond_wait(n, m) pthread_mutex_lock(m); pthread_cond_wait(n, m); pthread_mutex_unlock(m)
 
 /* {length, coef, coef, coef}  and scaled by 2^15
    for now, only length 9, optimal way to get +85% bandwidth */
@@ -1413,8 +1425,8 @@ void optimal_lrmix(void)
 	if (output.padded) {
 		fprintf(stderr, "warning: lrmix does not support padding\n");
 	}
-	freq1 = controller.freqs[0];
-	freq2 = controller.freqs[1];
+	freq1 = controller.freqs[0].freq;
+	freq2 = controller.freqs[1].freq;
 	bw = demod.rate_out;
 	freq = freq1 / 2 + freq2 / 2 + bw;
 	mr = (uint32_t)abs((int64_t)freq1 - (int64_t)freq2) + bw;
@@ -1449,16 +1461,17 @@ static void *controller_thread_fn(void *arg)
 	int i;
 	struct controller_state *s = arg;
 	double elapsedtime;
+	freq_state *f;
 
 	if (s->wb_mode) {
 		if (verbosity)
 			fprintf(stderr, "wbfm: adding 16000 Hz to every input frequency\n");
 		for (i=0; i < s->freq_len; i++) {
-			s->freqs[i] += 16000;}
+			s->freqs[i].freq += 16000;}
 	}
 
 	/* set up primary channel */
-	optimal_settings(s->freqs[0], demod.rate_in);
+	optimal_settings(s->freqs[0].freq, demod.rate_in);
 	demod.squelch_level = squelch_to_rms(demod.squelch_level, &dongle, &demod);
 	if (dongle.direct_sampling) {
 		verbose_direct_sampling(dongle.dev, dongle.direct_sampling);}
@@ -1496,7 +1509,8 @@ static void *controller_thread_fn(void *arg)
 			continue;}
 		/* hacky hopping */
 		s->freq_now = (s->freq_now + 1) % s->freq_len;
-		freqd = s->freq_now;
+		s->freq = &s->freqs[s->freq_now];
+		f = s->freq;		
 		if (s->freq_now == 0) {
 			if (controller.speedtest) {
 				gettimeofday(&time2, NULL);
@@ -1508,15 +1522,15 @@ static void *controller_thread_fn(void *arg)
 			if (single) {
 				do_exit = 1;}
 		}
-		freqd = s->freqs[s->freq_now];
+		freqd = f->freq;
 		if (s->wb_mode) {
 		    freqd -= 16000;}
 		
-		demod.squelch_level = s->squelches[s->freq_now];
-		demod.conseq_squelch = s->conseq_squelches[s->freq_now];
+		demod.squelch_level = f->squelch;
+		demod.conseq_squelch = f->conseq_squelch;
 		demod.squelch_level = squelch_to_rms(demod.squelch_level, &dongle, &demod);
 
-		optimal_settings(s->freqs[s->freq_now], demod.rate_in);
+		optimal_settings(f->freq, demod.rate_in);
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
 		dongle.mute = BUFFER_DUMP;
 	}
@@ -1527,6 +1541,7 @@ void frequency_range(struct controller_state *s, char *arg)
 {
 	char *start, *stop, *step;
 	int i;
+	freq_state *f;
 	start = arg;
 	stop = strchr(start, ':') + 1;
 	stop[-1] = '\0';
@@ -1534,7 +1549,10 @@ void frequency_range(struct controller_state *s, char *arg)
 	step[-1] = '\0';
 	for(i=(int)atofs(start); i<=(int)atofs(stop); i+=(int)atofs(step))
 	{
-		s->freqs[s->freq_len] = (uint32_t)i;
+		f = &s->freqs[s->freq_len];
+		f->freq = (uint32_t)i;
+		f->squelch = demod.squelch_level;
+		f->conseq_squelch = demod.conseq_squelch;
 		s->freq_len++;
 		if (s->freq_len >= FREQUENCIES_LIMIT) {
 			break;}
@@ -1630,7 +1648,7 @@ void output_cleanup(struct output_state *s)
 
 void controller_init(struct controller_state *s)
 {
-	s->freqs[0] = 100000000;
+	s->freqs[0].freq = 100000000;
 	s->freq_len = 0;
 	s->edge = 0;
 	s->speedtest = 0;
@@ -1756,7 +1774,8 @@ int main(int argc, char **argv)
 				{frequency_range(&controller, optarg);}
 			else
 			{
-				controller.freqs[controller.freq_len] = (uint32_t)atofs(optarg);
+				freq_state *f = &controller.freqs[controller.freq_len];
+				f->freq = (uint32_t)atofs(optarg);				
 				controller.freq_len++;
 			}
 			break;
@@ -1908,10 +1927,11 @@ int main(int argc, char **argv)
 
 
 	for (i = 0; i < FREQUENCIES_LIMIT; i++) {
-		controller.squelches[i] = demod.squelch_level;
-		controller.conseq_squelches[i] = demod.conseq_squelch;
-		controller.gains[i] = dongle.gain;
-		controller.ppms[i] = dongle.ppm_error;
+		freq_state *f = &controller.freqs[i];
+		f->squelch = demod.squelch_level;
+		f->conseq_squelch = demod.conseq_squelch;
+		f->gain = dongle.gain;
+		f->ppm = dongle.ppm_error;		
 	}
 	
 
