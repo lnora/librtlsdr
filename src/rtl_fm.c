@@ -222,6 +222,9 @@ struct output_state
 	pthread_t thread;
 	FILE     *file;
 	char     *filename;
+	char     *freqsfilename;
+	int      freqs;
+	char     *multidir;	
 	struct buffer_bucket results[2];
 	int      rate;
 	int      wav_format;
@@ -236,6 +239,11 @@ struct controller_state
 	uint32_t freqs[FREQUENCIES_LIMIT];
 	int      freq_len;
 	int      freq_now;
+	int      squelches[FREQUENCIES_LIMIT];
+	int      conseq_squelches[FREQUENCIES_LIMIT];
+	int      squelch_timeouts[FREQUENCIES_LIMIT];	
+	int      gains[FREQUENCIES_LIMIT];
+	int      ppms[FREQUENCIES_LIMIT];	
 	int      edge;
 	int      speedtest;
 	int      wb_mode;
@@ -322,6 +330,81 @@ void usage(void)
 	exit(1);
 }
 
+void load_frequencies(char *filename, int reload)
+{
+	char line[LINE_MAX];
+	char *s;
+	FILE *fp;
+	
+	if (reload == 1) {
+		controller.freq_len = 0;
+	}
+	
+	fp = fopen(filename, "r");
+	if (fp != NULL) {
+		while (fgets(line, LINE_MAX, fp) != NULL)
+		{			
+			char *tok, *e;
+			int i = 0, idx;
+			s = line;
+
+			e = strchr(s,'#');
+			idx = (int)(e - s);
+			
+			if (idx == 0) {
+				continue;
+			}
+		
+			/* frequency, [squelch], [conseq_squelch], [squelch_timeout], [gain], [ppm] 
+			 * * = use default value
+			 */
+			while((tok = strsep(&s,",")))
+			{
+				char *pos;
+				if ((pos = strchr(tok, '*')) != NULL) {
+					i++;
+					continue;
+				}
+				if ((pos = strchr(tok, '\n')) != NULL)
+					*pos = '\0';
+				switch (i)
+				{
+					case 0:
+						controller.freqs[controller.freq_len] = (uint32_t)atofs(tok);
+						break;
+						
+					case 1:
+						controller.squelches[controller.freq_len] = (int)atof(tok);
+						break;
+
+					case 2:
+						controller.conseq_squelches[controller.freq_len] = (int)atof(tok);
+						break;
+
+					case 3:
+						controller.squelch_timeouts[controller.freq_len] = (int)atof(tok);
+						break;
+						
+					case 4:
+						controller.gains[controller.freq_len] = (int)(atof(tok) * 10);
+						break;
+						
+					case 5:
+						controller.ppms[controller.freq_len] = atoi(tok);
+						break;
+				}
+				i++;
+			}
+			if (i > 0)
+			{
+				controller.freq_len++;
+			}
+		}
+	}
+	
+	fclose(fp);
+}
+
 #ifdef _WIN32
 BOOL WINAPI
 sighandler(int signum)
@@ -338,8 +421,22 @@ sighandler(int signum)
 static void sighandler(int signum)
 {
 	fprintf(stderr, "Signal caught, exiting!\n");
-	do_exit = 1;
-	rtlsdr_cancel_async(dongle.dev);
+	int i;
+	
+	if (signum == SIGUSR1) {
+		fprintf(stderr, "Reload frequencies\n");
+		for (i = 0; i < FREQUENCIES_LIMIT; i++) {
+			controller.squelches[i] = demod.squelch_level;
+			controller.conseq_squelches[i] = demod.conseq_squelch;
+			controller.gains[i] = dongle.gain;
+			controller.ppms[i] = dongle.ppm_error;
+		}		
+		load_frequencies(output.freqsfilename, 1);
+	} else {
+		fprintf(stderr, "Signal caught, exiting!\n");
+		do_exit = 1;
+		rtlsdr_cancel_async(dongle.dev);
+	}	
 }
 #endif
 
@@ -1410,7 +1507,15 @@ static void *controller_thread_fn(void *arg)
 			/* single-shot mode */
 			if (single) {
 				do_exit = 1;}
-		}		
+		}
+		freqd = s->freqs[s->freq_now];
+		if (s->wb_mode) {
+		    freqd -= 16000;}
+		
+		demod.squelch_level = s->squelches[s->freq_now];
+		demod.conseq_squelch = s->conseq_squelches[s->freq_now];
+		demod.squelch_level = squelch_to_rms(demod.squelch_level, &dongle, &demod);
+
 		optimal_settings(s->freqs[s->freq_now], demod.rate_in);
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
 		dongle.mute = BUFFER_DUMP;
@@ -1627,6 +1732,8 @@ int main(int argc, char **argv)
 	int r, opt;
 	int dev_given = 0;
 	int custom_ppm = 0;
+	int freqsfile = 0;
+	int i;
 
 	int timeConstant = 75; /* default: U.S. 75 uS */
 	int rtlagc = 0;
@@ -1636,7 +1743,7 @@ int main(int argc, char **argv)
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:m:g:s:b:l:L:o:t:r:p:E:q:F:A:M:c:v:h:w:1:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:m:g:s:b:l:L:o:t:r:p:E:q:U:F:A:M:c:v:h:w:1:")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1690,6 +1797,10 @@ int main(int argc, char **argv)
 			dongle.ppm_error = atoi(optarg);
 			custom_ppm = 1;
 			break;
+		case 'U':
+			output.freqsfilename = optarg;
+			freqsfile = 1;
+			break;			
 		case '1':
 			single = 1;
 			break;			
@@ -1795,7 +1906,22 @@ int main(int argc, char **argv)
 	if (verbosity)
 		fprintf(stderr, "verbosity set to %d\n", verbosity);
 
+
+	for (i = 0; i < FREQUENCIES_LIMIT; i++) {
+		controller.squelches[i] = demod.squelch_level;
+		controller.conseq_squelches[i] = demod.conseq_squelch;
+		controller.gains[i] = dongle.gain;
+		controller.ppms[i] = dongle.ppm_error;
+	}
+	
+
 	agc_init(&demod);
+
+	if (freqsfile == 1) {
+		load_frequencies(output.freqsfilename, 0);
+	} else {
+		output.freqsfilename = NULL;
+	}
 
 	/* quadruple sample_rate to limit to Δθ to ±π/2 */
 	demod.rate_in *= demod.post_downsample;
@@ -1837,6 +1963,7 @@ int main(int argc, char **argv)
 	sigaction(SIGTERM, &sigact, NULL);
 	sigaction(SIGQUIT, &sigact, NULL);
 	sigaction(SIGPIPE, &sigact, NULL);
+	sigaction(SIGUSR1, &sigact, NULL);	
 	signal(SIGPIPE, SIG_IGN);
 #else
 	SetConsoleCtrlHandler( (PHANDLER_ROUTINE) sighandler, TRUE );
