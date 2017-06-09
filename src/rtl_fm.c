@@ -135,6 +135,7 @@ struct dongle_state
 	uint32_t freq;
 	uint32_t rate;
 	uint32_t bandwidth;
+	int      prev_gain;
 	int      gain;
 	int16_t  *buf16;
 	uint32_t buf_len;
@@ -238,7 +239,7 @@ typedef struct fstate
 {
 	uint32_t freq;
 	int      squelch, conseq_squelch, squelch_timeout;
-	int      gain, ppm;
+	int      prev_gain, gain, ppm;
 	int      min_sr, max_sr, prev_sr, squelch_delta, squelch_sum, squelch_avg;
 	time_t   first_squelch, last_squelch;
 } freq_state;
@@ -285,6 +286,7 @@ void usage(void)
 		"\t[-Q squelch_delta (default: 30)]\n"		
 		"\t[-w tuner_bandwidth in Hz (default: automatic)]\n"
 		"\t[-l squelch_level (default: 0/off)]\n"
+		"\t[-q squelch_timeout (default: 300)]\n"		
 		"\t[-L N  prints levels every N calculations]\n"
 		"\t    output are comma separated values (csv):\n"
 		"\t	avg rms since last output, max rms since last output, overall max rms, squelch (paramed), rms, rms level, avg rms level\n"
@@ -448,6 +450,7 @@ static void sighandler(int signum)
 			f = &controller.freqs[i];
 			f->squelch = demod.squelch_level;
 			f->conseq_squelch = demod.conseq_squelch;
+			f->squelch_timeout = demod.squelch_timeout;
 			f->gain = dongle.gain;
 			f->ppm = dongle.ppm_error;			
 		}		
@@ -1560,10 +1563,23 @@ static void *controller_thread_fn(void *arg)
 		
 		demod.squelch_level = f->squelch;
 		demod.conseq_squelch = f->conseq_squelch;
+		demod.squelch_timeout = f->squelch_timeout;
 		demod.squelch_level = squelch_to_rms(demod.squelch_level, &dongle, &demod);
 		demod.prev_sr = 0;
 		demod.squelch_delta = 0;
 		demod.squelch_sum = 0;		
+
+		if (dongle.prev_gain != f->gain) {
+			if (f->gain == AUTO_GAIN) {
+				f->prev_gain = f->gain;
+				rtlsdr_set_tuner_gain_mode(dongle.dev, 0);
+			} else {
+				f->prev_gain = f->gain;
+				dongle.gain = nearest_gain(dongle.dev, f->gain);
+				rtlsdr_set_tuner_gain_mode(dongle.dev, 1);
+				rtlsdr_set_tuner_gain(dongle.dev, dongle.gain);
+			}
+		}
 
 		optimal_settings(f->freq, demod.rate_in);
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
@@ -1588,6 +1604,7 @@ void frequency_range(struct controller_state *s, char *arg)
 		f->freq = (uint32_t)i;
 		f->squelch = demod.squelch_level;
 		f->conseq_squelch = demod.conseq_squelch;
+		f->squelch_timeout = demod.squelch_timeout;
 		s->freq_len++;
 		if (s->freq_len >= FREQUENCIES_LIMIT) {
 			break;}
@@ -1800,7 +1817,7 @@ int main(int argc, char **argv)
 	output_init(&output);
 	controller_init(&controller);
 
-	while ((opt = getopt(argc, argv, "d:f:m:g:s:b:l:L:o:t:r:p:E:q:U:F:A:M:c:v:h:w:1:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:f:m:g:s:b:l:L:o:t:r:p:E:q:Q:U:F:A:M:c:v:h:w:1:")) != -1) {
 		switch (opt) {
 		case 'd':
 			dongle.dev_index = verbose_device_search(optarg);
@@ -1827,6 +1844,12 @@ int main(int argc, char **argv)
 		case 'l':
 			demod.squelch_level = (int)atof(optarg);
 			break;
+		case 'q':
+			demod.squelch_timeout = (int)atof(optarg);
+			break;			
+		case 'Q':
+			demod.squelch_trig = (int)atof(optarg);
+			break;			
 		case 'L':
 			printLevels = (int)atof(optarg);
 			break;
@@ -1891,7 +1914,9 @@ int main(int argc, char **argv)
 			if (strcmp("speedtest",  optarg) == 0) {
 				controller.speedtest = 1;}
 			if (strcmp("ds1", optarg) == 0) {
-				demod.ds1 = 1;}			
+				demod.ds1 = 1;}
+			if (strcmp("ds2", optarg) == 0) {
+				demod.ds2 = 1;}		
 			if (strcmp("wav",  optarg) == 0) {
 				output.wav_format = 1;}
 			if (strcmp("pad",  optarg) == 0) {
@@ -1969,6 +1994,7 @@ int main(int argc, char **argv)
 		freq_state *f = &controller.freqs[i];
 		f->squelch = demod.squelch_level;
 		f->conseq_squelch = demod.conseq_squelch;
+		f->squelch_timeout = demod.squelch_timeout;
 		f->gain = dongle.gain;
 		f->ppm = dongle.ppm_error;		
 	}
