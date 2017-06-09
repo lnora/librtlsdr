@@ -90,6 +90,7 @@
 #define FREQUENCIES_LIMIT		1024
 
 #define SQUELCH_TIMEOUT			100
+#define SQUELCH_DELTA			30
 
 #define PI_INT				(1<<14)
 #define ONE_INT				(1<<14)
@@ -184,7 +185,8 @@ struct demod_state
 	int      post_downsample;
 	int      output_scale;
 	int      squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch;
-	int      squelch_timer;
+	int      squelch_timer, squelch_timeout, default_squelch;
+	int      prev_sr, squelch_trig, squelch_delta, squelch_sum, squelch_avg;
 	int      downsample_passes;
 	int      comp_fir_size;
 	int      custom_atan;
@@ -193,7 +195,7 @@ struct demod_state
 	int      prev_lpr_index;
 	int      dc_block, dc_avg;
 	int      log1, log2, log3, log4;
-	int      ds1;
+	int      ds1, ds2;
 	int      rotate_enable;
 	struct   translate_state rotate;
 	enum	 agc_mode_t agc_mode;
@@ -280,6 +282,7 @@ void usage(void)
 		"\t[-s sample_rate (default: 24k)]\n"
 		"\t[-d device_index (default: 0)]\n"
                 "\t[-g tuner_gain (default: automatic)]\n"
+		"\t[-Q squelch_delta (default: 30)]\n"		
 		"\t[-w tuner_bandwidth in Hz (default: automatic)]\n"
 		"\t[-l squelch_level (default: 0/off)]\n"
 		"\t[-L N  prints levels every N calculations]\n"
@@ -305,6 +308,7 @@ void usage(void)
 		"\t    log4:   enable logging frequency and signal level\n"
 		"\t    speedtest: enable scanning speed test\n"
 		"\t    ds1: enable dynamic squelch 1\n"		
+		"\t    ds2: enable dynamic squelch 2\n"		
 		"\t    wav:    generate WAV header\n"
 		"\t    pad:    pad output gaps with zeros\n"
 		"\t    lrmix:  one channel goes to left audio, one to right (broken)\n"
@@ -1023,6 +1027,7 @@ void full_demod(struct demod_state *d)
 	int i, ds_p;
 	int do_squelch = 0;
 	int sr = 0;
+	freq_state *f = controller.freq;
 	if(d->rotate_enable) {
 		translate(d);
 	}
@@ -1046,8 +1051,10 @@ void full_demod(struct demod_state *d)
 	/* power squelch */
 	if (d->squelch_level) {
 		sr = rms(d->lowpassed, d->lp_len, 1);
+		f->min_sr = fmin(sr, f->min_sr);
+		f->max_sr = fmax(sr, f->max_sr);		
 		if (d->log3) {
-			fprintf(stderr, "freq,%10u,Hz,-,signal,%5u,%5u,%5u,%5u,%5u\r", freqd, sr, d->squelch_level, d->squelch_hits, d->conseq_squelch, d->squelch_timer);
+			fprintf(stderr, "freq,%10u,Hz,-,signal,%5u,%5u,%5u,%5u,%5u,%5u,%5u\r", freqd, sr, d->squelch_level, d->squelch_hits, d->conseq_squelch, d->squelch_timer, d->squelch_timeout, d->squelch_delta);
 		}
 		if (d->log4) {
 			fprintf(stderr, "freq,%10u,Hz,-,signal,%5u,%5u\n", freqd, sr, d->squelch_level);
@@ -1088,7 +1095,19 @@ void full_demod(struct demod_state *d)
 			}
 		}		
 		d->squelch_hits = 0;
-		d->squelch_timer++;
+		d->squelch_delta = abs(d->prev_sr - sr);
+		d->squelch_sum += d->squelch_delta;
+		d->prev_sr = sr;
+		if (!d->ds2 || d->squelch_delta < d->squelch_trig) {			
+			d->squelch_timer++;
+		} else {
+			d->squelch_timer = 0;
+			d->conseq_squelch++;
+		}
+		f->last_squelch = time(NULL);
+		if (f->first_squelch == 0) {
+			f->first_squelch = f->last_squelch;
+		}		
 	}
 	if (d->squelch_level && d->squelch_hits > d->conseq_squelch) {
 		d->agc->gain_num = d->agc->gain_den;
@@ -1230,8 +1249,8 @@ static void *demod_thread_fn(void *arg)
 			continue;
 		    }
 
-		    if (d->squelch_timer >= SQUELCH_TIMEOUT) {
-			    d->squelch_timer = 0;
+		    if (d->squelch_timeout != 0 && d->squelch_timer >= d->squelch_timeout) {
+			    d->squelch_avg = floor(d->squelch_sum / d->squelch_timer);
 			    safe_cond_signal(&controller.hop, &controller.hop_m);
 			    continue;
 		    }
@@ -1458,7 +1477,7 @@ static void *controller_thread_fn(void *arg)
 {
 	// thoughts for multiple dongles
 	// might be no good using a controller thread if retune/rate blocks
-	int i;
+	int i, r;
 	struct controller_state *s = arg;
 	double elapsedtime;
 	freq_state *f;
@@ -1508,6 +1527,19 @@ static void *controller_thread_fn(void *arg)
 		if (output.lrmix) {
 			continue;}
 		/* hacky hopping */
+		s->freq = &s->freqs[s->freq_now];
+		f = s->freq;		
+		f->prev_sr = demod.prev_sr;
+		f->squelch_avg = demod.squelch_avg;		
+		if (demod.squelch_timer >= demod.squelch_timeout) {
+			if (demod.ds2 && demod.squelch_avg < demod.squelch_trig) {
+				if (verbosity) {
+					fprintf(stderr,"%5u,%5u\n", f->squelch, f->squelch + 1);
+				}
+				f->squelch++;
+			}
+		}
+		demod.squelch_timer = 0;
 		s->freq_now = (s->freq_now + 1) % s->freq_len;
 		s->freq = &s->freqs[s->freq_now];
 		f = s->freq;		
@@ -1529,6 +1561,9 @@ static void *controller_thread_fn(void *arg)
 		demod.squelch_level = f->squelch;
 		demod.conseq_squelch = f->conseq_squelch;
 		demod.squelch_level = squelch_to_rms(demod.squelch_level, &dongle, &demod);
+		demod.prev_sr = 0;
+		demod.squelch_delta = 0;
+		demod.squelch_sum = 0;		
 
 		optimal_settings(f->freq, demod.rate_in);
 		rtlsdr_set_center_freq(dongle.dev, dongle.freq);
@@ -1584,6 +1619,10 @@ void demod_init(struct demod_state *s)
 	s->terminate_on_squelch = 0;
 	s->squelch_hits = 11;
 	s->squelch_timer = 0;
+	s->squelch_delta = 0;
+	s->squelch_sum = 0;
+	s->squelch_avg = 0;
+	s->prev_sr = 0;	
 	s->downsample_passes = 0;
 	s->comp_fir_size = 0;
 	s->prev_index = 0;
