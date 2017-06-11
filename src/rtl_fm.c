@@ -89,7 +89,7 @@
 
 #define FREQUENCIES_LIMIT		1024
 
-#define SQUELCH_TIMEOUT			100
+#define SQUELCH_TIMEOUT			300
 
 #define PI_INT				(1<<14)
 #define ONE_INT				(1<<14)
@@ -183,7 +183,7 @@ struct demod_state
 	int      downsample;    /* min 1, max 256 */
 	int      post_downsample;
 	int      output_scale;
-	int      squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch;
+	int      squelch_level, conseq_squelch, squelch_hits, terminate_on_squelch, squelch_timeout;
 	int      squelch_timer;
 	int      downsample_passes;
 	int      comp_fir_size;
@@ -433,9 +433,9 @@ sighandler(int signum)
 #else
 static void sighandler(int signum)
 {
-	fprintf(stderr, "Signal caught, exiting!\n");
 	int i;
 	freq_state *f;
+	fprintf(stderr, "Signal caught, exiting!\n");
 	
 	if (signum == SIGUSR1) {
 		fprintf(stderr, "Reload frequencies\n");
@@ -932,23 +932,18 @@ int mad(int16_t *samples, int len, int step)
 }
 
 int rms(int16_t *samples, int len, int step)
-/* largely lifted from rtl_power */
+/* edits to correctly calculate rms power based on i and q data */
 {
 	int i;
-	long p, t, s;
-	double dc, err;
-
-	p = t = 0L;
-	for (i=0; i<len; i+=step) {
-		s = (long)samples[i];
-		t += s;
-		p += s * s;
+	long r, j, rms;
+	
+	rms = 0;
+	for (i=0; i<len; i+=2) {
+		r = (long)samples[i];
+		j = (long)samples[i++];
+		rms += sqrt((r*r)+(j*j));
 	}
-	/* correct for dc offset in squares */
-	dc = (double)(t*step) / (double)len;
-	err = t * 2 * dc - dc * dc * len;
-
-	return (int)sqrt((p-err) / len);
+	return rms/len;
 }
 
 int squelch_to_rms(int db, struct dongle_state *dongle, struct demod_state *demod)
@@ -1057,6 +1052,7 @@ void full_demod(struct demod_state *d)
 	}
 	if (do_squelch) {
 		d->squelch_hits++;
+		d->squelch_timer = 0;
 		if (d->log2) {
 			if (d->squelch_hits > 0) {
 				time_t long_time;
@@ -1226,11 +1222,12 @@ static void *demod_thread_fn(void *arg)
 		    if (d->squelch_hits > d->conseq_squelch) {
 			unmark_shared_buffer(d->lowpassed);
 			d->squelch_hits = d->conseq_squelch + 1;  /* hair trigger */
+			d->squelch_timer = 0;
 			safe_cond_signal(&controller.hop, &controller.hop_m);
 			continue;
 		    }
 
-		    if (d->squelch_timer >= SQUELCH_TIMEOUT) {
+		    if (d->squelch_timer >= d->squelch_timeout) {
 			    d->squelch_timer = 0;
 			    safe_cond_signal(&controller.hop, &controller.hop_m);
 			    continue;
@@ -1365,11 +1362,6 @@ static void optimal_settings(int freq, int rate)
 		capture_freq = freq + capture_rate/4;}
 	if (verbosity >= 2)
 		fprintf(stderr, "capture_rate = dm->downsample * dm->rate_in = %d * %d = %d\n", dm->downsample, dm->rate_in, capture_rate );
-	if (!d->offset_tuning) {
-		capture_freq = freq - capture_rate/4;
-		if (verbosity >= 2)
-			fprintf(stderr, "optimal_settings(freq = %u): capture_freq = freq - capture_rate/4 = %u\n", freq, capture_freq );
-	}
 	capture_freq += cs->edge * dm->rate_in / 2;
 	if (verbosity >= 2)
 		fprintf(stderr, "optimal_settings(freq = %u): capture_freq +=  cs->edge * dm->rate_in / 2 = %d * %d / 2 = %u\n", freq, cs->edge, dm->rate_in, capture_freq );
@@ -1463,6 +1455,12 @@ static void *controller_thread_fn(void *arg)
 	double elapsedtime;
 	freq_state *f;
 
+	if (s->freq_len > 1) {
+		demod.squelch_level = s->freqs[0].squelch;
+		demod.conseq_squelch = s->freqs[0].conseq_squelch;
+		demod.squelch_timeout = s->freqs[0].squelch_timeout;
+	}
+
 	if (s->wb_mode) {
 		if (verbosity)
 			fprintf(stderr, "wbfm: adding 16000 Hz to every input frequency\n");
@@ -1527,7 +1525,11 @@ static void *controller_thread_fn(void *arg)
 		    freqd -= 16000;}
 		
 		demod.squelch_level = f->squelch;
+		if (demod.squelch_hits == demod.conseq_squelch+1) {
+			demod.squelch_hits = f->conseq_squelch + 1;
+		}
 		demod.conseq_squelch = f->conseq_squelch;
+		demod.squelch_timeout = f->squelch_timeout;
 		demod.squelch_level = squelch_to_rms(demod.squelch_level, &dongle, &demod);
 
 		optimal_settings(f->freq, demod.rate_in);
@@ -1584,6 +1586,7 @@ void demod_init(struct demod_state *s)
 	s->terminate_on_squelch = 0;
 	s->squelch_hits = 11;
 	s->squelch_timer = 0;
+	s->squelch_timeout = SQUELCH_TIMEOUT;
 	s->downsample_passes = 0;
 	s->comp_fir_size = 0;
 	s->prev_index = 0;
